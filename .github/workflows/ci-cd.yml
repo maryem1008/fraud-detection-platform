@@ -1,0 +1,246 @@
+name: fraud-detection-platform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: Force a retraining run even if drift is not detected
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install development dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements-dev.txt
+      - name: Run tests with coverage
+        run: pytest --cov=fraud_detection --cov-report=xml --cov-report=term-missing
+      - name: Lint with Ruff
+        run: ruff check src tests scripts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  check_drift:
+    name: check_drift
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      drift_detected: ${{ steps.detect.outputs.drift_detected }}
+      drift_score: ${{ steps.detect.outputs.drift_score }}
+      production_window_available: ${{ steps.window.outputs.available }}
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      CURRENT_WINDOW_URL: ${{ secrets.CURRENT_WINDOW_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install project and monitoring dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements-dev.txt
+      - name: Check whether Kaggle data access is configured
+        id: credentials
+        shell: bash
+        run: |
+          if [[ -n "$KAGGLE_USERNAME" && -n "$KAGGLE_KEY" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare training reference from Kaggle
+        if: steps.credentials.outputs.available == 'true'
+        shell: bash
+        run: |
+          python -m pip install 'kaggle>=1.6,<2'
+          mkdir -p "$HOME/.kaggle" data/raw
+          printf '{"username":"%s","key":"%s"}\n' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > "$HOME/.kaggle/kaggle.json"
+          chmod 600 "$HOME/.kaggle/kaggle.json"
+          kaggle datasets download -d mlg-ulb/creditcardfraud -p data/raw --unzip
+          python scripts/prepare_data.py
+      - name: Select the current drift window
+        id: window
+        shell: bash
+        run: |
+          if [[ -n "$CURRENT_WINDOW_URL" ]]; then
+            mkdir -p data
+            curl --fail --silent --show-error --location "$CURRENT_WINDOW_URL" --output data/current_window.csv
+            echo "path=data/current_window.csv" >> "$GITHUB_OUTPUT"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=data/processed/test.csv" >> "$GITHUB_OUTPUT"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "No CURRENT_WINDOW_URL is configured; the historical holdout proxy must not trigger automatic retraining."
+          fi
+      - name: Run Evidently drift check
+        id: detect
+        shell: bash
+        env:
+          KAGGLE_AVAILABLE: ${{ steps.credentials.outputs.available }}
+          CURRENT_FILE: ${{ steps.window.outputs.path }}
+        run: |
+          mkdir -p artifacts
+          if [[ "$KAGGLE_AVAILABLE" == "true" ]]; then
+            python scripts/check_drift.py \
+              --reference data/reference.csv \
+              --current "$CURRENT_FILE" \
+              --threshold 0.3 \
+              --window-rows 5000 \
+              --output-dir artifacts \
+              --github-output
+          else
+            cat > artifacts/drift_signal.json <<'JSON'
+          {"drift_score": null, "drift_threshold": 0.3, "drift_detected": false, "reason": "KAGGLE_USERNAME/KAGGLE_KEY are not configured; no reference data was downloaded."}
+          JSON
+            echo "drift_detected=false" >> "$GITHUB_OUTPUT"
+            echo "drift_score=0" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidently-drift-report-${{ github.run_id }}
+          path: |
+            artifacts/drift_report.html
+            artifacts/drift_signal.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  retrain:
+    name: retrain
+    needs: [check_drift]
+    if: >-
+      always() && (
+        (needs.check_drift.result == 'success' &&
+         needs.check_drift.outputs.drift_detected == 'true' &&
+         needs.check_drift.outputs.production_window_available == 'true') ||
+        (github.event_name == 'workflow_dispatch' && inputs.force_retrain == true)
+      )
+    runs-on: ubuntu-latest
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install training dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements-dev.txt && pip install 'kaggle>=1.6,<2'
+      - name: Validate required retraining secrets
+        shell: bash
+        run: |
+          [[ -n "$KAGGLE_USERNAME" && -n "$KAGGLE_KEY" ]] || { echo 'Kaggle Actions secrets are required for retraining.' >&2; exit 1; }
+          [[ -n "$MLFLOW_TRACKING_URI" ]] || { echo 'MLFLOW_TRACKING_URI must point to a persistent tracking server for CI retraining.' >&2; exit 1; }
+      - name: Download data and prepare chronological splits
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.kaggle" data/raw
+          printf '{"username":"%s","key":"%s"}\n' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > "$HOME/.kaggle/kaggle.json"
+          chmod 600 "$HOME/.kaggle/kaggle.json"
+          kaggle datasets download -d mlg-ulb/creditcardfraud -p data/raw --unzip
+          python scripts/prepare_data.py
+      - name: Train and log a new MLflow run
+        run: python scripts/train.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: |
+            models/feature_schema.json
+            models/isolation_forest.joblib
+            models/isolation_scaler.joblib
+            models/thresholds.json
+            models/xgboost_model.json
+          if-no-files-found: error
+          retention-days: 30
+
+  build_and_push:
+    name: build_and_push
+    needs: [test, retrain]
+    # Main pushes build the checked-in model; a successful retrain also builds the fresh model artifact.
+    if: >-
+      always() && needs.test.result == 'success' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.retrain.result == 'skipped') ||
+        needs.retrain.result == 'success'
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: needs.retrain.result == 'success'
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        if: needs.retrain.result == 'success'
+        with:
+          name: trained-models
+          path: models
+      - name: Compute lowercase image name and tags
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.sha_tag }}
+
+  deploy:
+    name: deploy
+    needs: [build_and_push]
+    if: needs.build_and_push.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+    steps:
+      - name: Deploy the new image revision
+        if: ${{ env.RENDER_DEPLOY_HOOK_URL != '' }}
+        shell: bash
+        run: |
+          image_url="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          curl --fail --silent --show-error --get \
+            --data-urlencode "imgURL=${image_url}" \
+            "$RENDER_DEPLOY_HOOK_URL"
+      - name: Explain skipped deploy
+        if: ${{ env.RENDER_DEPLOY_HOOK_URL == '' }}
+        run: echo 'Deployment skipped; configure RENDER_DEPLOY_HOOK_URL after provisioning the free-tier service.'

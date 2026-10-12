@@ -1,0 +1,7 @@
+{
+  "xgb_probability": 0.9208909273147583,
+  "isolation_anomaly_score": 0.254114182749507,
+  "tuning_objective": "F2 with per-component validation FPR budget",
+  "max_component_validation_fpr": 0.0005,
+  "max_ensemble_validation_fpr": 0.001
+}

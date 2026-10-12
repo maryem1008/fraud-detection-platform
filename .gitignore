@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Data and trained artifacts (large / user-provided)
+data/raw/*
+data/processed/*
+data/reference.csv
+data/current_window.csv
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+models/*
+!models/.gitkeep
+!models/feature_schema.json
+!models/isolation_forest.joblib
+!models/isolation_scaler.joblib
+!models/thresholds.json
+!models/xgboost_model.json
+artifacts/*
+mlruns/
+mlartifacts/
+*.sqlite
+*.db
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+.DS_Store
