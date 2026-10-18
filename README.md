@@ -190,16 +190,6 @@ data/                     local only; raw and processed CSVs are Git-ignored
 
 The dataset is Kaggle's `mlg-ulb/creditcardfraud` benchmark with anonymized PCA features. The dataset report records its listed **DbCL-1.0** license; review those terms before reuse beyond this portfolio/demo. This repository's **MIT** license applies to the project code, not automatically to Kaggle data or third-party assets. Raw and processed data are excluded from the repository.
 
-## Further reports
-
-- [Exploratory data analysis](notebooks/01_eda.md)
-- [Model evaluation and Isolation Forest sensitivity](notebooks/02_model_evaluation.md)
-- [API benchmark and latency caveats](notebooks/03_api_performance.md)
-- [Docker build and final one-worker container measurements](notebooks/04_docker.md)
-- [Drift-monitoring methodology](notebooks/05_drift_monitoring.md)
-- [MLflow tracking and manual retraining](notebooks/06_mlflow_tracking.md)
-- [Free-tier deployment research and simulation](notebooks/07_deployment_research.md)
-
 ## License
 
 Project code: MIT. See [LICENSE](LICENSE). The dataset and any other third-party materials retain their respective terms.
