@@ -1,4 +1,3 @@
-# Fraud Detection Platform
 
 An end-to-end, chronological fraud-screening portfolio project: reproducible data preparation, an XGBoost-primary classifier, an auditable Isolation Forest anomaly score, MLflow experiment tracking, a FastAPI scoring service, Evidently drift checks, Docker, and GitHub Actions.
 
